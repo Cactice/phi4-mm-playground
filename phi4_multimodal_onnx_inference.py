@@ -255,6 +255,7 @@ def run_text_model(
     model_config: Dict,
     inputs_embeds: np.ndarray,
     attention_mask: np.ndarray,
+    run_options: Optional[ort.RunOptions],
     past_key_values: Optional[List[np.ndarray]] = None,
 ) -> Tuple[np.ndarray, List[np.ndarray]]:
     """Run the text (LLM) model for generation."""
@@ -284,7 +285,7 @@ def run_text_model(
                 (1, num_kv_heads, 0, head_dim), dtype=np.float32
             )
 
-    outputs = text_session.run(None, text_inputs)
+    outputs = text_session.run(None, text_inputs, run_options)
     logits = outputs[0]
     new_past_key_values = []
     for i in range(1, len(outputs)):
@@ -301,9 +302,11 @@ def softmax(x: np.ndarray) -> np.ndarray:
 
 def generate_text(
     text_session,
+    embedding_session,
     model_config: Dict,
     inputs_embeds: np.ndarray,
     attention_mask: np.ndarray,
+    run_options: ort.RunOptions,
     max_new_tokens: int = 100,
     temperature: float = 0.7,
     top_p: float = 0.9,
@@ -312,11 +315,12 @@ def generate_text(
     generated_tokens = []
     past_key_values = None
     current_attention_mask = attention_mask.copy()
+    current_inputs_embeds = inputs_embeds.copy()
 
     logits, past_key_values = run_text_model(
         text_session,
         model_config,
-        inputs_embeds,
+        current_inputs_embeds,
         current_attention_mask,
         past_key_values,
     )
@@ -340,13 +344,6 @@ def generate_text(
                     "-inf"
                 )
 
-        # if temperature > 0:
-        #     probabilities = softmax(next_token_logits)
-        #     if np.any(np.isnan(probabilities)) or np.sum(probabilities) == 0:
-        #         next_token = np.argmax(next_token_logits)
-        #     else:
-        #         next_token = np.random.choice(len(probabilities), p=probabilities)
-        # else:
         next_token = np.argmax(next_token_logits)
 
         generated_tokens.append(int(next_token))
@@ -354,16 +351,28 @@ def generate_text(
         if next_token == EOS_TOKEN_ID or next_token == END_TOKEN_ID:
             break
 
-        current_attention_mask = np.concatenate(
-            [current_attention_mask, np.ones((1, 1), dtype=np.int64)], axis=1
+        # For subsequent iterations, we need to convert the new token to embeddings
+        # For subsequent tokens, use empty audio features since audio is only needed for the initial prompt
+        new_token_ids = np.array([[next_token]], dtype=np.int64)
+
+        # Use empty audio features for subsequent tokens
+        empty_audio_features = np.zeros((0, 3072), dtype=np.float32)
+        new_token_embeds = run_embedding_model(
+            embedding_session, new_token_ids, empty_audio_features
         )
 
-        inputs_embeds = np.concatenate([inputs_embeds, next_token_logits], axis=1)
+        # Concatenate new token embeddings with previous embeddings
+        current_inputs_embeds = np.concatenate(
+            [current_inputs_embeds, new_token_embeds], axis=1
+        )
+
+        # Run text model with the concatenated embeddings
         logits, past_key_values = run_text_model(
             text_session,
             model_config,
-            inputs_embeds,
-            current_attention_mask[:, -1:],  # Only the new token's mask
+            current_inputs_embeds,
+            current_attention_mask[:, -1:],
+            run_options,
             past_key_values,
         )
 
@@ -386,6 +395,7 @@ def transcribe_audio(
     speech_session, speech_adapter, embedding_session, text_session = load_onnx_models(
         model_path
     )
+    run_options = create_run_options_with_adapters([speech_adapter])
     tokenizer = load_tokenizer(model_path)
 
     # Process audio
@@ -406,9 +416,11 @@ def transcribe_audio(
     # Generate text
     generated_token_ids = generate_text(
         text_session,
+        embedding_session,
         model_config,
         inputs_embeds,
         attention_mask,
+        run_options,
         max_new_tokens=max_new_tokens,
         temperature=temperature,
         top_p=top_p,
@@ -423,9 +435,7 @@ def transcribe_audio(
 
 def main():
     """Example usage of the Phi-4 multimodal ONNX pipeline."""
-    model_path = (
-        "/Users/yuya/git/phi4-mm-playground/models/Phi-4-Multimodal-ONNX-INT4-CPU"
-    )
+    model_path = "/Users/yuya/git/phi4-mm-playground-2/Phi-4-Multimodal-ONNX-INT4-CPU"
     sample_audio_path = "/Users/yuya/git/phi4-mm-playground-2/1272-141231-0002.mp3"
 
     if not Path(model_path).exists():
