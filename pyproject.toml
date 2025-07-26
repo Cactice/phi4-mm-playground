@@ -1,0 +1,40 @@
+[project]
+name = "phi4-mm-playground"
+version = "0.1.0"
+description = "Phi-4 Multimodal ONNX Runtime GenAI playground"
+requires-python = ">=3.13"
+dependencies = [
+  "pip",
+  "backoff",
+  "huggingface_hub",
+  "numpy<2.0.0",           # Version constraint as specified in requirements
+  "onnx>= 1.18.0",
+  "onnxruntime==1.22.1",
+  "onnxscript",
+  "peft>=0.15",
+  "pillow",
+  "requests",
+  "scipy",
+  "soundfile",
+  "torch>=2.7.1",
+  "torchaudio>=2.7.1",
+  "torchvision>=0.20.0",
+  "transformers==4.51.3",
+  "openvino>=2025.1.0",
+  "nncf>=2.16",
+  "notebook-utils>=0.2.0",
+  "flatbuffers>=25.2.10",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["examples"]
+
+[tool.uv]
+dev-dependencies = [
+  # Will install torch manually later with specific nightly versions
+  "ipykernel>=6.30.0",
+]
