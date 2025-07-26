@@ -324,30 +324,33 @@ def generate_text(
     run_options: ort.RunOptions,
     max_new_tokens: int = 100,
 ) -> List[int]:
-    """Generate text using iterative decoding."""
-    print(f"[DEBUG] Starting text generation with max_new_tokens={max_new_tokens}")
+    """Generate text using iterative decoding with proper KV-cache optimization."""
+    print(f"[DEBUG] Starting KV-cache optimized text generation with max_new_tokens={max_new_tokens}")
     print(
         f"[DEBUG] Initial inputs_embeds.shape={inputs_embeds.shape}, attention_mask.shape={attention_mask.shape}"
     )
 
     generated_tokens = []
     past_key_values = None
-    current_attention_mask = attention_mask.copy()
-    current_inputs_embeds = inputs_embeds.copy()
-
-    print("[DEBUG] Running first text model call...")
+    full_attention_mask = attention_mask.copy()
+    
+    # --- First pass: Process the entire prompt ---
+    print("[DEBUG] Running first text model call with full prompt...")
     logits, past_key_values = run_text_model(
         text_session,
         model_config,
-        current_inputs_embeds,
-        current_attention_mask,
+        inputs_embeds,
+        full_attention_mask,
         run_options,
-        past_key_values,
+        past_key_values,  # This will be None for first pass
     )
     print(f"[DEBUG] First logits shape: {logits.shape}")
 
+    # --- Subsequent passes: Process one token at a time with KV-cache ---
     for step in range(max_new_tokens):
         print(f"[DEBUG] Generation step {step + 1}/{max_new_tokens}")
+        
+        # Get the next token from the last position of the logits
         next_token_logits = logits[0, -1, :]
         print(
             f"[DEBUG] Next token logits shape: {next_token_logits.shape}, min/max: {np.min(next_token_logits):.3f}/{np.max(next_token_logits):.3f}"
@@ -362,46 +365,34 @@ def generate_text(
             print(f"[DEBUG] Hit end token ({next_token}), stopping generation")
             break
 
-        # For subsequent iterations, we need to convert the new token to embeddings
-        # For subsequent tokens, use empty audio features since audio is only needed for the initial prompt
+        # Prepare inputs for the next iteration
         new_token_ids = np.array([[next_token]], dtype=np.int64)
         print(f"[DEBUG] New token IDs shape: {new_token_ids.shape}")
-
-        # Use empty audio features for subsequent tokens
+        
+        # Get embeddings for only the new token
         empty_audio_features = np.zeros((0, 3072), dtype=np.float32)
         print("[DEBUG] Running embedding model for new token...")
         new_token_embeds = run_embedding_model(
             embedding_session, new_token_ids, empty_audio_features
         )
         print(f"[DEBUG] New token embeds shape: {new_token_embeds.shape}")
-
-        # Concatenate new token embeddings with previous embeddings
-        print(
-            f"[DEBUG] Before concatenation: current_inputs_embeds.shape={current_inputs_embeds.shape}"
-        )
-        current_inputs_embeds = np.concatenate(
-            [current_inputs_embeds, new_token_embeds], axis=1
-        )
-        print(
-            f"[DEBUG] After concatenation: current_inputs_embeds.shape={current_inputs_embeds.shape}"
-        )
-
-        # Update attention mask for the new token
+        
+        # CRITICAL FIX: Update the full attention mask to include new token
+        # The attention mask represents ALL tokens that should be attended to
         new_attention = np.ones((1, 1), dtype=np.int64)
-        current_attention_mask = np.concatenate(
-            [current_attention_mask, new_attention], axis=1
-        )
-        print(f"[DEBUG] Updated attention mask shape: {current_attention_mask.shape}")
+        full_attention_mask = np.concatenate([full_attention_mask, new_attention], axis=1)
+        print(f"[DEBUG] Updated full attention mask shape: {full_attention_mask.shape}")
 
-        # Run text model with the concatenated embeddings
-        print("[DEBUG] Running text model with concatenated embeddings...")
+        # Run the model with only the new token's embedding and KV-cache
+        # Key insight: Input only new token, but attention mask covers full sequence
+        print("[DEBUG] Running text model with single token embedding and full attention mask...")
         logits, past_key_values = run_text_model(
             text_session,
             model_config,
-            current_inputs_embeds,
-            current_attention_mask,
+            new_token_embeds,      # Only the new token's embedding (1, 1, hidden_size)
+            full_attention_mask,   # Full attention mask covering all tokens (1, total_seq_len)
             run_options,
-            past_key_values,
+            past_key_values,       # KV-cache from previous steps
         )
 
     return generated_tokens
