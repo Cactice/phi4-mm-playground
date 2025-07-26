@@ -225,11 +225,8 @@ def load_onnx_models(model_path: Path, providers: List[str] = None):
     return speech_session, speech_adapter, embedding_session, text_session
 
 
-def run_speech_model(
-    speech_session, speech_adapter, audio_inputs: Dict[str, np.ndarray]
-) -> np.ndarray:
+def run_speech_model(speech_session, audio_inputs: Dict[str, np.ndarray]) -> np.ndarray:
     """Run the speech encoder model."""
-    # Temporarily disable adapter usage due to compatibility issues
     outputs = speech_session.run(None, audio_inputs)
     audio_features = outputs[0]
     return audio_features
@@ -239,14 +236,20 @@ def run_embedding_model(
     embedding_session, input_ids: np.ndarray, audio_features: np.ndarray
 ) -> np.ndarray:
     """Run the embedding model to merge text and audio embeddings."""
+    print(
+        f"[DEBUG] run_embedding_model called with input_ids.shape={input_ids.shape}, audio_features.shape={audio_features.shape}"
+    )
+
     embed_inputs = {
         "input_ids": input_ids.astype(np.int64),
         "image_features": np.zeros((0, 3072), dtype=np.float32),
         "audio_features": audio_features.astype(np.float32),
     }
+    print(f"[DEBUG] Embedding inputs prepared: {list(embed_inputs.keys())}")
 
     outputs = embedding_session.run(None, embed_inputs)
     inputs_embeds = outputs[0]
+    print(f"[DEBUG] Embedding model outputs shape: {inputs_embeds.shape}")
     return inputs_embeds
 
 
@@ -259,23 +262,35 @@ def run_text_model(
     past_key_values: Optional[List[np.ndarray]] = None,
 ) -> Tuple[np.ndarray, List[np.ndarray]]:
     """Run the text (LLM) model for generation."""
+    print(
+        f"[DEBUG] run_text_model called with inputs_embeds.shape={inputs_embeds.shape}, attention_mask.shape={attention_mask.shape}"
+    )
+    print(f"[DEBUG] past_key_values provided: {past_key_values is not None}")
+
     text_inputs = {
         "inputs_embeds": inputs_embeds.astype(np.float32),
         "attention_mask": attention_mask.astype(np.int64),
     }
 
     if past_key_values is not None:
+        print(
+            f"[DEBUG] Using existing past_key_values with {len(past_key_values)} items"
+        )
         for i, kv in enumerate(past_key_values):
             if i % 2 == 0:
                 text_inputs[f"past_key_values.{i // 2}.key"] = kv
             else:
                 text_inputs[f"past_key_values.{i // 2}.value"] = kv
     else:
+        print("[DEBUG] Initializing empty past_key_values...")
         num_layers = model_config.get("num_hidden_layers", 32)
         num_kv_heads = model_config.get("num_key_value_heads", 8)
         hidden_size = model_config.get("hidden_size", 3072)
         num_attention_heads = model_config.get("num_attention_heads", 24)
         head_dim = hidden_size // num_attention_heads
+        print(
+            f"[DEBUG] Model config: layers={num_layers}, kv_heads={num_kv_heads}, hidden={hidden_size}, heads={num_attention_heads}, head_dim={head_dim}"
+        )
 
         for layer_idx in range(num_layers):
             text_inputs[f"past_key_values.{layer_idx}.key"] = np.zeros(
@@ -285,19 +300,19 @@ def run_text_model(
                 (1, num_kv_heads, 0, head_dim), dtype=np.float32
             )
 
+    print(f"[DEBUG] Running text session with {len(text_inputs)} inputs...")
     outputs = text_session.run(None, text_inputs, run_options)
+    print(f"[DEBUG] Text session returned {len(outputs)} outputs")
+
     logits = outputs[0]
+    print(f"[DEBUG] Logits shape: {logits.shape}")
+
     new_past_key_values = []
     for i in range(1, len(outputs)):
         new_past_key_values.append(outputs[i])
+    print(f"[DEBUG] Created {len(new_past_key_values)} new past_key_values")
 
     return logits, new_past_key_values
-
-
-def softmax(x: np.ndarray) -> np.ndarray:
-    """Compute softmax of input array."""
-    exp_x = np.exp(x - np.max(x))
-    return exp_x / np.sum(exp_x)
 
 
 def generate_text(
@@ -308,70 +323,83 @@ def generate_text(
     attention_mask: np.ndarray,
     run_options: ort.RunOptions,
     max_new_tokens: int = 100,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
 ) -> List[int]:
     """Generate text using iterative decoding."""
+    print(f"[DEBUG] Starting text generation with max_new_tokens={max_new_tokens}")
+    print(
+        f"[DEBUG] Initial inputs_embeds.shape={inputs_embeds.shape}, attention_mask.shape={attention_mask.shape}"
+    )
+
     generated_tokens = []
     past_key_values = None
     current_attention_mask = attention_mask.copy()
     current_inputs_embeds = inputs_embeds.copy()
 
+    print("[DEBUG] Running first text model call...")
     logits, past_key_values = run_text_model(
         text_session,
         model_config,
         current_inputs_embeds,
         current_attention_mask,
+        run_options,
         past_key_values,
     )
+    print(f"[DEBUG] First logits shape: {logits.shape}")
 
     for step in range(max_new_tokens):
+        print(f"[DEBUG] Generation step {step + 1}/{max_new_tokens}")
         next_token_logits = logits[0, -1, :]
-
-        if temperature > 0:
-            next_token_logits = next_token_logits / temperature
-
-        if top_p < 1.0:
-            sorted_indices = np.argsort(next_token_logits)[::-1]
-            sorted_logits = next_token_logits[sorted_indices]
-            cumulative_probs = np.cumsum(softmax(sorted_logits))
-
-            sorted_indices_to_remove = cumulative_probs > top_p
-            if sorted_indices_to_remove.any():
-                first_removed = np.where(sorted_indices_to_remove)[0][0]
-                sorted_indices_to_remove[:first_removed] = False
-                next_token_logits[sorted_indices[sorted_indices_to_remove]] = float(
-                    "-inf"
-                )
+        print(
+            f"[DEBUG] Next token logits shape: {next_token_logits.shape}, min/max: {np.min(next_token_logits):.3f}/{np.max(next_token_logits):.3f}"
+        )
 
         next_token = np.argmax(next_token_logits)
+        print(f"[DEBUG] Selected token: {next_token}")
 
         generated_tokens.append(int(next_token))
 
         if next_token == EOS_TOKEN_ID or next_token == END_TOKEN_ID:
+            print(f"[DEBUG] Hit end token ({next_token}), stopping generation")
             break
 
         # For subsequent iterations, we need to convert the new token to embeddings
         # For subsequent tokens, use empty audio features since audio is only needed for the initial prompt
         new_token_ids = np.array([[next_token]], dtype=np.int64)
+        print(f"[DEBUG] New token IDs shape: {new_token_ids.shape}")
 
         # Use empty audio features for subsequent tokens
         empty_audio_features = np.zeros((0, 3072), dtype=np.float32)
+        print("[DEBUG] Running embedding model for new token...")
         new_token_embeds = run_embedding_model(
             embedding_session, new_token_ids, empty_audio_features
         )
+        print(f"[DEBUG] New token embeds shape: {new_token_embeds.shape}")
 
         # Concatenate new token embeddings with previous embeddings
+        print(
+            f"[DEBUG] Before concatenation: current_inputs_embeds.shape={current_inputs_embeds.shape}"
+        )
         current_inputs_embeds = np.concatenate(
             [current_inputs_embeds, new_token_embeds], axis=1
         )
+        print(
+            f"[DEBUG] After concatenation: current_inputs_embeds.shape={current_inputs_embeds.shape}"
+        )
+
+        # Update attention mask for the new token
+        new_attention = np.ones((1, 1), dtype=np.int64)
+        current_attention_mask = np.concatenate(
+            [current_attention_mask, new_attention], axis=1
+        )
+        print(f"[DEBUG] Updated attention mask shape: {current_attention_mask.shape}")
 
         # Run text model with the concatenated embeddings
+        print("[DEBUG] Running text model with concatenated embeddings...")
         logits, past_key_values = run_text_model(
             text_session,
             model_config,
             current_inputs_embeds,
-            current_attention_mask[:, -1:],
+            current_attention_mask,
             run_options,
             past_key_values,
         )
@@ -384,36 +412,68 @@ def transcribe_audio(
     audio_path: str,
     user_prompt: str = "Transcribe the audio clip into text.",
     max_new_tokens: int = 100,
-    temperature: float = 0.7,
-    top_p: float = 0.9,
 ) -> str:
     """Main function to transcribe audio with a text prompt."""
+    print("[DEBUG] Starting transcription with parameters:")
+    print(f"  - model_path: {model_path}")
+    print(f"  - audio_path: {audio_path}")
+    print(f"  - user_prompt: {user_prompt}")
+    print(f"  - max_new_tokens: {max_new_tokens}")
+
     model_path = Path(model_path)
 
     # Load models and configuration
+    print("[DEBUG] Loading model configuration...")
     model_config = load_model_config(model_path)
+    print(f"[DEBUG] Model config: {model_config}")
+
+    print("[DEBUG] Loading ONNX models...")
     speech_session, speech_adapter, embedding_session, text_session = load_onnx_models(
         model_path
     )
+    print(f"[DEBUG] Speech adapter loaded: {speech_adapter is not None}")
+
+    print("[DEBUG] Creating run options with adapters...")
     run_options = create_run_options_with_adapters([speech_adapter])
+    print(f"[DEBUG] Run options created: {run_options}")
+
+    print("[DEBUG] Loading tokenizer...")
     tokenizer = load_tokenizer(model_path)
+    print(f"[DEBUG] Tokenizer vocab size: {tokenizer.vocab_size}")
 
     # Process audio
+    print("[DEBUG] Processing audio...")
     waveform, sr = load_audio(audio_path)
+    print(f"[DEBUG] Audio loaded: shape={waveform.shape}, sr={sr}")
+
     log_mel_features = extract_log_mel_features(waveform, sr)
+    print(f"[DEBUG] Log-mel features extracted: shape={log_mel_features.shape}")
+
     audio_inputs = prepare_audio_inputs(log_mel_features)
+    print(f"[DEBUG] Audio inputs prepared: {list(audio_inputs.keys())}")
 
     # Extract audio features
-    audio_features = run_speech_model(speech_session, speech_adapter, audio_inputs)
+    print("[DEBUG] Running speech model...")
+    audio_features = run_speech_model(speech_session, audio_inputs)
+    print(f"[DEBUG] Audio features extracted: shape={audio_features.shape}")
 
     # Prepare text prompt
+    print("[DEBUG] Preparing text prompt...")
     formatted_prompt = format_prompt(user_prompt, include_audio=True)
+    print(f"[DEBUG] Formatted prompt: {formatted_prompt[:100]}...")
+
     input_ids, attention_mask = encode_prompt(tokenizer, formatted_prompt)
+    print(
+        f"[DEBUG] Encoded prompt: input_ids.shape={input_ids.shape}, attention_mask.shape={attention_mask.shape}"
+    )
 
     # Merge embeddings
+    print("[DEBUG] Running embedding model...")
     inputs_embeds = run_embedding_model(embedding_session, input_ids, audio_features)
+    print(f"[DEBUG] Inputs embeddings created: shape={inputs_embeds.shape}")
 
     # Generate text
+    print("[DEBUG] Starting text generation...")
     generated_token_ids = generate_text(
         text_session,
         embedding_session,
@@ -422,14 +482,15 @@ def transcribe_audio(
         attention_mask,
         run_options,
         max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=top_p,
     )
+    print(f"[DEBUG] Generated {len(generated_token_ids)} tokens: {generated_token_ids}")
 
     # Decode result
+    print("[DEBUG] Decoding tokens...")
     transcription = decode_tokens(
         tokenizer, generated_token_ids, skip_special_tokens=True
     )
+    print(f"[DEBUG] Final transcription: {transcription}")
     return transcription
 
 
@@ -448,7 +509,6 @@ def main():
             audio_path=sample_audio_path,
             user_prompt="Transcribe the audio clip into text.",
             max_new_tokens=20,
-            temperature=1.0,
         )
 
         print(f"\n{'=' * 60}")
