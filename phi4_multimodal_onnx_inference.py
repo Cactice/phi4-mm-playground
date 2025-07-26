@@ -26,9 +26,40 @@ import soundfile as sf
 
 # Audio configuration constants
 SAMPLE_RATE = 16000
-N_FFT = 512
-HOP_LENGTH = 160
-N_MELS = 80
+AUDIO_COMPRESSION_RATE = 8
+
+# STFT Normal (16kHz) configuration
+STFT_NORMAL_N_FFT = 512
+STFT_NORMAL_FRAME_LENGTH = 400
+STFT_NORMAL_HOP_LENGTH = 160
+STFT_NORMAL_WIN_FN = "hamming"
+
+# LogMel (16kHz) configuration
+LOGMEL_CHUNK_SIZE = 30
+LOGMEL_HOP_LENGTH = 160
+LOGMEL_N_FFT = 512
+LOGMEL_N_MEL = 80
+LOGMEL_FEATURE_FIRST = 0
+LOGMEL_NO_PADDING = 1
+
+# STFT Normal 8kHz configuration
+STFT_NORMAL_8K_N_FFT = 256
+STFT_NORMAL_8K_FRAME_LENGTH = 200
+STFT_NORMAL_8K_HOP_LENGTH = 80
+STFT_NORMAL_8K_WIN_FN = "hamming"
+
+# LogMel 8kHz configuration
+LOGMEL_8K_CHUNK_SIZE = 30
+LOGMEL_8K_HOP_LENGTH = 80
+LOGMEL_8K_N_FFT = 512
+LOGMEL_8K_N_MEL = 80
+LOGMEL_8K_FEATURE_FIRST = 0
+LOGMEL_8K_NO_PADDING = 1
+
+# Legacy constants for backward compatibility
+N_FFT = LOGMEL_N_FFT
+HOP_LENGTH = LOGMEL_HOP_LENGTH
+N_MELS = LOGMEL_N_MEL
 
 # Token constants
 USER_TOKEN = "<|user|>"
@@ -42,6 +73,33 @@ EOS_TOKEN_ID = 199999
 
 
 # Audio processing functions
+def get_audio_config() -> Dict[str, any]:
+    """Get complete audio processing configuration."""
+    return {
+        "audio_compression_rate": AUDIO_COMPRESSION_RATE,
+        "stft_normal/n_fft": STFT_NORMAL_N_FFT,
+        "stft_normal/frame_length": STFT_NORMAL_FRAME_LENGTH,
+        "stft_normal/hop_length": STFT_NORMAL_HOP_LENGTH,
+        "stft_normal/win_fn": STFT_NORMAL_WIN_FN,
+        "logmel/chunk_size": LOGMEL_CHUNK_SIZE,
+        "logmel/hop_length": LOGMEL_HOP_LENGTH,
+        "logmel/n_fft": LOGMEL_N_FFT,
+        "logmel/n_mel": LOGMEL_N_MEL,
+        "logmel/feature_first": LOGMEL_FEATURE_FIRST,
+        "logmel/no_padding": LOGMEL_NO_PADDING,
+        "stft_normal_8k/n_fft": STFT_NORMAL_8K_N_FFT,
+        "stft_normal_8k/frame_length": STFT_NORMAL_8K_FRAME_LENGTH,
+        "stft_normal_8k/hop_length": STFT_NORMAL_8K_HOP_LENGTH,
+        "stft_normal_8k/win_fn": STFT_NORMAL_8K_WIN_FN,
+        "logmel_8k/chunk_size": LOGMEL_8K_CHUNK_SIZE,
+        "logmel_8k/hop_length": LOGMEL_8K_HOP_LENGTH,
+        "logmel_8k/n_fft": LOGMEL_8K_N_FFT,
+        "logmel_8k/n_mel": LOGMEL_8K_N_MEL,
+        "logmel_8k/feature_first": LOGMEL_8K_FEATURE_FIRST,
+        "logmel_8k/no_padding": LOGMEL_8K_NO_PADDING,
+    }
+
+
 def load_audio(audio_path: str) -> Tuple[np.ndarray, int]:
     """Load audio file and return waveform and sample rate."""
     waveform, sr = sf.read(audio_path)
@@ -55,7 +113,8 @@ def resample_audio(waveform: np.ndarray, orig_sr: int, target_sr: int) -> np.nda
     if orig_sr == target_sr:
         return waveform
 
-    waveform_tensor = torch.from_numpy(waveform).unsqueeze(0)
+    # Ensure float32 dtype and proper tensor format for torchaudio
+    waveform_tensor = torch.from_numpy(waveform.astype(np.float32)).unsqueeze(0)
     resampler = torchaudio.transforms.Resample(orig_sr, target_sr)
     return resampler(waveform_tensor).squeeze().numpy()
 
@@ -71,10 +130,11 @@ def extract_log_mel_features(waveform: np.ndarray, sr: int) -> np.ndarray:
 
     mel_transform = torchaudio.transforms.MelSpectrogram(
         sample_rate=SAMPLE_RATE,
-        n_fft=N_FFT,
-        hop_length=HOP_LENGTH,
-        n_mels=N_MELS,
+        n_fft=LOGMEL_N_FFT,
+        hop_length=LOGMEL_HOP_LENGTH,
+        n_mels=LOGMEL_N_MEL,
         window_fn=torch.hamming_window,
+        win_length=STFT_NORMAL_FRAME_LENGTH,
     )
 
     mel_spec = mel_transform(waveform_tensor)
@@ -87,7 +147,7 @@ def extract_log_mel_features(waveform: np.ndarray, sr: int) -> np.ndarray:
 def prepare_audio_inputs(log_mel_features: np.ndarray) -> Dict[str, np.ndarray]:
     """Prepare audio inputs for the speech ONNX model."""
     num_frames, n_mels = log_mel_features.shape
-    assert n_mels == 80, f"Expected 80 Mel bins, got {n_mels}"
+    assert n_mels == LOGMEL_N_MEL, f"Expected {LOGMEL_N_MEL} Mel bins, got {n_mels}"
 
     audio_embeds = log_mel_features[np.newaxis, :, :].astype(np.float32)
     audio_attention_mask = np.ones((1, num_frames), dtype=bool)
@@ -120,16 +180,13 @@ def load_tokenizer(model_path: str) -> GPT2Tokenizer:
     return tokenizer
 
 
-def format_prompt(user_prompt: str, include_audio: bool = True) -> str:
-    """Format prompt in Phi-4 chat format with optional audio placeholder."""
-    if include_audio:
-        audio_placeholder = AUDIO_SPECIAL_TOKEN * 166
-        prompt_with_audio = f"{AUDIO_PLACEHOLDER}{audio_placeholder}{user_prompt}"
-        formatted_prompt = (
-            f"{USER_TOKEN}{prompt_with_audio}{END_TOKEN}{ASSISTANT_TOKEN}"
-        )
-    else:
-        formatted_prompt = f"{USER_TOKEN}{user_prompt}{END_TOKEN}{ASSISTANT_TOKEN}"
+def format_prompt(user_prompt: str, audio_size: int) -> str:
+    """Format prompt in Phi-4 chat format with audio placeholder and user task prompt."""
+    audio_placeholder = AUDIO_SPECIAL_TOKEN * audio_size
+    # Follow the recommended format: <|user|><audio>{task prompt}<|end|><|assistant|>{label}<|end|>
+    formatted_prompt = (
+        f"{USER_TOKEN}{audio_placeholder}{user_prompt}{END_TOKEN}{ASSISTANT_TOKEN}"
+    )
 
     return formatted_prompt
 
@@ -325,7 +382,9 @@ def generate_text(
     max_new_tokens: int = 100,
 ) -> List[int]:
     """Generate text using iterative decoding with proper KV-cache optimization."""
-    print(f"[DEBUG] Starting KV-cache optimized text generation with max_new_tokens={max_new_tokens}")
+    print(
+        f"[DEBUG] Starting KV-cache optimized text generation with max_new_tokens={max_new_tokens}"
+    )
     print(
         f"[DEBUG] Initial inputs_embeds.shape={inputs_embeds.shape}, attention_mask.shape={attention_mask.shape}"
     )
@@ -333,23 +392,22 @@ def generate_text(
     generated_tokens = []
     past_key_values = None
     full_attention_mask = attention_mask.copy()
-    
-    # --- First pass: Process the entire prompt ---
-    print("[DEBUG] Running first text model call with full prompt...")
-    logits, past_key_values = run_text_model(
-        text_session,
-        model_config,
-        inputs_embeds,
-        full_attention_mask,
-        run_options,
-        past_key_values,  # This will be None for first pass
-    )
-    print(f"[DEBUG] First logits shape: {logits.shape}")
 
-    # --- Subsequent passes: Process one token at a time with KV-cache ---
+    # Initialize current embeddings and run text model for first time
+    current_embeds = inputs_embeds
+
     for step in range(max_new_tokens):
-        print(f"[DEBUG] Generation step {step + 1}/{max_new_tokens}")
-        
+        # Run the text model
+        logits, past_key_values = run_text_model(
+            text_session,
+            model_config,
+            current_embeds,
+            full_attention_mask,
+            run_options,
+            past_key_values,
+        )
+        print(f"[DEBUG] Logits shape: {logits.shape}")
+
         # Get the next token from the last position of the logits
         next_token_logits = logits[0, -1, :]
         print(
@@ -358,7 +416,6 @@ def generate_text(
 
         next_token = np.argmax(next_token_logits)
         print(f"[DEBUG] Selected token: {next_token}")
-
         generated_tokens.append(int(next_token))
 
         if next_token == EOS_TOKEN_ID or next_token == END_TOKEN_ID:
@@ -368,32 +425,21 @@ def generate_text(
         # Prepare inputs for the next iteration
         new_token_ids = np.array([[next_token]], dtype=np.int64)
         print(f"[DEBUG] New token IDs shape: {new_token_ids.shape}")
-        
+
         # Get embeddings for only the new token
         empty_audio_features = np.zeros((0, 3072), dtype=np.float32)
         print("[DEBUG] Running embedding model for new token...")
-        new_token_embeds = run_embedding_model(
+        current_embeds = run_embedding_model(
             embedding_session, new_token_ids, empty_audio_features
         )
-        print(f"[DEBUG] New token embeds shape: {new_token_embeds.shape}")
-        
-        # CRITICAL FIX: Update the full attention mask to include new token
-        # The attention mask represents ALL tokens that should be attended to
-        new_attention = np.ones((1, 1), dtype=np.int64)
-        full_attention_mask = np.concatenate([full_attention_mask, new_attention], axis=1)
-        print(f"[DEBUG] Updated full attention mask shape: {full_attention_mask.shape}")
+        print(f"[DEBUG] New token embeds shape: {current_embeds.shape}")
 
-        # Run the model with only the new token's embedding and KV-cache
-        # Key insight: Input only new token, but attention mask covers full sequence
-        print("[DEBUG] Running text model with single token embedding and full attention mask...")
-        logits, past_key_values = run_text_model(
-            text_session,
-            model_config,
-            new_token_embeds,      # Only the new token's embedding (1, 1, hidden_size)
-            full_attention_mask,   # Full attention mask covering all tokens (1, total_seq_len)
-            run_options,
-            past_key_values,       # KV-cache from previous steps
+        # Update the full attention mask to include new token
+        new_attention = np.ones((1, 1), dtype=np.int64)
+        full_attention_mask = np.concatenate(
+            [full_attention_mask, new_attention], axis=1
         )
+        print(f"[DEBUG] Updated full attention mask shape: {full_attention_mask.shape}")
 
     return generated_tokens
 
@@ -450,7 +496,8 @@ def transcribe_audio(
 
     # Prepare text prompt
     print("[DEBUG] Preparing text prompt...")
-    formatted_prompt = format_prompt(user_prompt, include_audio=True)
+    audio_size = audio_inputs["audio_sizes"][0] // AUDIO_COMPRESSION_RATE
+    formatted_prompt = format_prompt(user_prompt, audio_size)
     print(f"[DEBUG] Formatted prompt: {formatted_prompt[:100]}...")
 
     input_ids, attention_mask = encode_prompt(tokenizer, formatted_prompt)
@@ -488,7 +535,7 @@ def transcribe_audio(
 def main():
     """Example usage of the Phi-4 multimodal ONNX pipeline."""
     model_path = "/Users/yuya/git/phi4-mm-playground-2/Phi-4-Multimodal-ONNX-INT4-CPU"
-    sample_audio_path = "/Users/yuya/git/phi4-mm-playground-2/1272-141231-0002.mp3"
+    sample_audio_path = "/Users/yuya/git/phi4-mm-playground-2/record.mp3"
 
     if not Path(model_path).exists():
         print(f"Model path does not exist: {model_path}")
@@ -499,7 +546,7 @@ def main():
             model_path=model_path,
             audio_path=sample_audio_path,
             user_prompt="Transcribe the audio clip into text.",
-            max_new_tokens=20,
+            max_new_tokens=40,
         )
 
         print(f"\n{'=' * 60}")
